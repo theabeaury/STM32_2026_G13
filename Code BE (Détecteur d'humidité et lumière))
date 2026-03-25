@@ -1,0 +1,160 @@
+Dans /* USER CODE BEGIN Includes */
+#include <stdio.h>    // pour snprintf()
+#include <string.h>   // pour les fonctions sur les chaînes si besoin
+
+Dans /* USER CODE BEGIN PD */
+#define LCD_I2C_ADDR (0x3E << 1)          // adresse I2C du LCD Grove (décalée pour HAL)
+#define VREF (3.3f)                       // tension de référence ADC
+#define ADC_MAX_COUNTS (4095.0f)          // valeur max ADC 12 bits
+#define MOIST_ADC_CHANNEL ADC_CHANNEL_15  // canal ADC du capteur d’humidité (PB0)
+#define LIGHT_ADC_CHANNEL ADC_CHANNEL_6   // canal ADC du capteur de lumière (PA1)
+#define DRY_VOLTAGE (1.6f)                // tension mesurée correspondant à 0% humidité
+#define WET_VOLTAGE (2.5f)                // tension mesurée correspondant à 100% humidité
+#define LIGHT_RAW_DARK (0.48f * ADC_MAX_COUNTS)   // valeur ADC en obscurité
+#define LIGHT_RAW_BRIGHT (0.9f * ADC_MAX_COUNTS)  // valeur ADC en forte lumière
+
+Dans /* USER CODE BEGIN PV */
+static char line1[17];   // buffer de texte pour la ligne 1 du LCD (16 caractères + '\0')
+static char line2[17];   // buffer de texte pour la ligne 2 du LCD
+
+/* Fonctions LCD */
+static void LCD_SendCommand(uint8_t cmd)   // envoie une commande au LCD via I2C
+{
+    uint8_t buf[2] = {0x80, cmd};          // 0x80 = octet de contrôle pour commande
+    HAL_I2C_Master_Transmit(&hi2c1, LCD_I2C_ADDR, buf, 2, 100);
+}
+
+static void LCD_SendChar(uint8_t c)        // envoie un caractère au LCD via I2C
+{
+    uint8_t buf[2] = {0x40, c};            // 0x40 = octet de contrôle pour donnée
+    HAL_I2C_Master_Transmit(&hi2c1, LCD_I2C_ADDR, buf, 2, 100);
+}
+
+static void LCD_Clear(void)                // efface l’écran
+{
+    LCD_SendCommand(0x01);
+    HAL_Delay(2);
+}
+
+static void LCD_Init(void)                 // initialise le contrôleur du LCD
+{
+    HAL_Delay(50);                         // attente après mise sous tension
+    LCD_SendCommand(0x38);                 // mode 8 bits, 2 lignes
+    LCD_SendCommand(0x39);                 // mode instruction étendu
+    LCD_SendCommand(0x14);                 // réglage oscillateur interne
+    LCD_SendCommand(0x70);                 // contraste
+    LCD_SendCommand(0x56);                 // alimentation / contraste
+    LCD_SendCommand(0x6C);                 // follower control
+    HAL_Delay(200);
+    LCD_SendCommand(0x38);                 // retour au mode normal
+    LCD_SendCommand(0x0C);                 // affichage ON, curseur OFF
+    LCD_Clear();
+}
+
+static void LCD_SetCursor(uint8_t row, uint8_t col)   // place le curseur
+{
+    uint8_t addr = (row == 0) ? 0x00 : 0x40;          // adresse DDRAM ligne 1 ou 2
+    LCD_SendCommand(0x80 | (addr + col));
+}
+
+static void LCD_Print(const char *s)       // affiche une chaîne caractère par caractère
+{
+    while (*s)
+        LCD_SendChar((uint8_t)*s++);
+}
+
+/* Fonctions ADC / humidité / lumière */
+static void ADC_SelectChannel(uint32_t channel)   // change le canal ADC actif
+{
+    ADC_ChannelConfTypeDef sConfig = {0};
+    sConfig.Channel = channel;
+    sConfig.Rank = ADC_REGULAR_RANK_1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_47CYCLES_5;
+    (void)HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+}
+static float ReadMoistureVoltage(void)     // lit la tension du capteur d’humidité
+{
+    ADC_SelectChannel(MOIST_ADC_CHANNEL);  // sélectionne PB0
+    HAL_Delay(1);                          // laisse le signal se stabiliser
+
+    HAL_ADC_Start(&hadc1);                 // démarre conversion
+    if (HAL_ADC_PollForConversion(&hadc1, 10) != HAL_OK)
+    {
+        HAL_ADC_Stop(&hadc1);
+        return 0.0f;
+    }
+
+    uint32_t raw = HAL_ADC_GetValue(&hadc1);   // récupère la valeur brute ADC
+    HAL_ADC_Stop(&hadc1);
+
+    return ((float)raw * VREF) / ADC_MAX_COUNTS;  // convertit en volts
+}
+static float VoltageToPercent(float v)     // convertit la tension humidité en %
+{
+    if (v <= DRY_VOLTAGE) return 0.0f;     // en dessous du seuil sec
+    if (v >= WET_VOLTAGE) return 100.0f;   // au-dessus du seuil humide
+
+    float p = ((v - DRY_VOLTAGE) / (WET_VOLTAGE - DRY_VOLTAGE)) * 100.0f;
+    return p;
+}
+static uint32_t ReadLightRaw(void)         // lit la lumière en valeur ADC brute
+{
+    ADC_ChannelConfTypeDef sConfig = {0};
+    sConfig.Channel = LIGHT_ADC_CHANNEL;   // sélectionne PA1
+    sConfig.Rank = ADC_REGULAR_RANK_1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_247CYCLES_5;  // temps long pour stabilité
+
+    if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) return 0;
+
+    HAL_ADC_Start(&hadc1);                 // 1re conversion "dummy"
+    if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK)
+        (void)HAL_ADC_GetValue(&hadc1);    // on jette cette mesure
+    HAL_ADC_Stop(&hadc1);
+
+    HAL_ADC_Start(&hadc1);                 // vraie conversion
+    if (HAL_ADC_PollForConversion(&hadc1, 10) != HAL_OK)
+    {
+        HAL_ADC_Stop(&hadc1);
+        return 0;
+    }
+
+    uint32_t raw = HAL_ADC_GetValue(&hadc1);
+    HAL_ADC_Stop(&hadc1);
+    return raw;
+}
+static float LightRawToPercent(uint32_t raw)   // convertit la lumière brute en %
+{
+    float v = (float)raw;
+
+    if (v <= LIGHT_RAW_DARK) return 0.0f;         // obscurité
+    if (v >= LIGHT_RAW_BRIGHT) return 100.0f;     // forte lumière
+
+    float p = ((v - LIGHT_RAW_DARK) / (LIGHT_RAW_BRIGHT - LIGHT_RAW_DARK)) * 100.0f;
+    return p;
+}
+
+Dans /* USER CODE BEGIN 2 */
+HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);      // démarre le PWM sur TIM2 canal 1
+__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 250); // fixe le duty cycle
+
+LCD_Init();                                    // initialise l’écran LCD
+
+LCD_SetCursor(0, 0);                           // positionne curseur ligne 1
+LCD_Print("Moisture sensor");                  // message de démarrage
+LCD_SetCursor(1, 0);                           // positionne curseur ligne 2
+LCD_Print("Init OK");                          // message de confirmation
+HAL_Delay(800);                                // laisse le message visible
+LCD_Clear();                                   // efface l’écran
+
+Dans /* USER CODE BEGIN 3 */
+float v = ReadMoistureVoltage();               // lit la tension humidité
+float pct = VoltageToPercent(v);               // convertit en % humidité
+
+int v_mV = (int)(v * 1000.0f + 0.5f);          // convertit en mV entiers avec arrondi
+int pct_i = (int)(pct + 0.5f);                 // % humidité arrondi
+
+snprintf(line1, sizeof(line1), "V=%d.%03dV %3d%%",
+         v_mV/1000, v_mV%1000, pct_i);         // prépare le texte de la ligne 1
+uint32_t light_raw = ReadLightRaw();           // lit la valeur brute du capteur de lumière
+float light_pct = LightRawToPercent(light_raw);// convertit en % lumière
+int light_i =

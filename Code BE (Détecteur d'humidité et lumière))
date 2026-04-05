@@ -1,160 +1,441 @@
-Dans /* USER CODE BEGIN Includes */
-#include <stdio.h>    // pour snprintf()
-#include <string.h>   // pour les fonctions sur les chaînes si besoin
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  *
+  * @description    : Ce programme mesure en continu l'humidité du sol via un
+  *                   capteur résistif (ADC canal 15, tension analogique) et
+  *                   l'intensité lumineuse via une photorésistance (ADC canal 6).
+  *                   Les résultats sont affichés sur un LCD 16x2 via I2C.
+  *                   Cible : STM32L476, SYSCLK = 80 MHz.
+  ******************************************************************************
+  */
+/* USER CODE END Header */
 
-Dans /* USER CODE BEGIN PD */
-#define LCD_I2C_ADDR (0x3E << 1)          // adresse I2C du LCD Grove (décalée pour HAL)
-#define VREF (3.3f)                       // tension de référence ADC
-#define ADC_MAX_COUNTS (4095.0f)          // valeur max ADC 12 bits
-#define MOIST_ADC_CHANNEL ADC_CHANNEL_15  // canal ADC du capteur d’humidité (PB0)
-#define LIGHT_ADC_CHANNEL ADC_CHANNEL_6   // canal ADC du capteur de lumière (PA1)
-#define DRY_VOLTAGE (1.6f)                // tension mesurée correspondant à 0% humidité
-#define WET_VOLTAGE (2.5f)                // tension mesurée correspondant à 100% humidité
-#define LIGHT_RAW_DARK (0.48f * ADC_MAX_COUNTS)   // valeur ADC en obscurité
-#define LIGHT_RAW_BRIGHT (0.9f * ADC_MAX_COUNTS)  // valeur ADC en forte lumière
+#include "main.h"
+#include "adc.h"    /* Déclaration de hadc1 et MX_ADC1_Init() */
+#include "i2c.h"    /* Déclaration de hi2c1 et MX_I2C1_Init() */
+#include "tim.h"    /* Déclaration de htim2 et MX_TIM2_Init() */
+#include "gpio.h"   /* Déclaration de MX_GPIO_Init() */
 
-Dans /* USER CODE BEGIN PV */
-static char line1[17];   // buffer de texte pour la ligne 1 du LCD (16 caractères + '\0')
-static char line2[17];   // buffer de texte pour la ligne 2 du LCD
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <stdio.h>    /* snprintf */
+#include <string.h>   /* strlen, memset */
+/* USER CODE END Includes */
 
-/* Fonctions LCD */
-static void LCD_SendCommand(uint8_t cmd)   // envoie une commande au LCD via I2C
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* Adresse I2C du LCD (ST7032 ou compatible), décalée d'un bit pour HAL */
+#define LCD_I2C_ADDR      (0x3E << 1)
+
+/* Référence de tension ADC (VDD = 3,3 V) */
+#define VREF              (3.3f)
+
+/* Résolution ADC 12 bits → 4095 niveaux */
+#define ADC_MAX_COUNTS    (4095.0f)
+
+/* Canaux ADC utilisés */
+#define MOIST_ADC_CHANNEL ADC_CHANNEL_15   /* Capteur d'humidité sol */
+#define LIGHT_ADC_CHANNEL ADC_CHANNEL_6    /* Photorésistance */
+
+/* Plage de calibration du capteur d'humidité (mesurée à sec et dans l'eau) */
+#define DRY_VOLTAGE       (1.6f)    /* Tension = sol sec → 0 % humidité */
+#define WET_VOLTAGE       (2.5f)    /* Tension = sol saturé → 100 % humidité */
+
+/* Plage de calibration de la photorésistance (valeurs brutes ADC) */
+#define LIGHT_RAW_DARK    (0.48f * ADC_MAX_COUNTS)   /* Obscurité totale → 0 % luminosité */
+#define LIGHT_RAW_BRIGHT  (0.82f * ADC_MAX_COUNTS)   /* Plein soleil → 100 % luminosité */
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+/* USER CODE BEGIN PV */
+
+/* Buffers d'affichage LCD — 16 caractères utiles + '\0' */
+static char line1[17];
+static char line2[17];
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+/* USER CODE BEGIN PFP */
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+/* ═══════════════════════════════════════════════════════════
+ *  LCD (contrôleur ST7032 ou compatible, interface I2C)
+ *
+ *  Protocole : chaque transfert I2C = 2 octets :
+ *    - octet de contrôle : 0x80 = commande, 0x40 = donnée (caractère)
+ *    - octet de données
+ * ═══════════════════════════════════════════════════════════ */
+
+/**
+ * @brief Envoie une commande au contrôleur LCD via I2C.
+ * @param cmd  Code de commande (ex. 0x01 = Clear, 0x0C = Display ON).
+ */
+static void LCD_SendCommand(uint8_t cmd)
 {
-    uint8_t buf[2] = {0x80, cmd};          // 0x80 = octet de contrôle pour commande
+    uint8_t buf[2] = {0x80, cmd};  /* 0x80 = octet de contrôle "commande" */
     HAL_I2C_Master_Transmit(&hi2c1, LCD_I2C_ADDR, buf, 2, 100);
 }
 
-static void LCD_SendChar(uint8_t c)        // envoie un caractère au LCD via I2C
+/**
+ * @brief Envoie un caractère ASCII à afficher à la position courante du curseur.
+ * @param c  Caractère à afficher.
+ */
+static void LCD_SendChar(uint8_t c)
 {
-    uint8_t buf[2] = {0x40, c};            // 0x40 = octet de contrôle pour donnée
+    uint8_t buf[2] = {0x40, c};   /* 0x40 = octet de contrôle "donnée" */
     HAL_I2C_Master_Transmit(&hi2c1, LCD_I2C_ADDR, buf, 2, 100);
 }
 
-static void LCD_Clear(void)                // efface l’écran
+/**
+ * @brief Efface l'écran LCD et replace le curseur en position (0, 0).
+ *        Un délai de 2 ms est requis après la commande Clear Display.
+ */
+static void LCD_Clear(void)
 {
-    LCD_SendCommand(0x01);
-    HAL_Delay(2);
+    LCD_SendCommand(0x01);  /* Commande "Clear Display" */
+    HAL_Delay(2);           /* Délai d'exécution requis par le contrôleur */
 }
 
-static void LCD_Init(void)                 // initialise le contrôleur du LCD
+/**
+ * @brief Initialise le LCD selon la séquence de démarrage du ST7032.
+ *        Configure le mode 8 bits, 2 lignes, et active le générateur de tension interne.
+ */
+static void LCD_Init(void)
 {
-    HAL_Delay(50);                         // attente après mise sous tension
-    LCD_SendCommand(0x38);                 // mode 8 bits, 2 lignes
-    LCD_SendCommand(0x39);                 // mode instruction étendu
-    LCD_SendCommand(0x14);                 // réglage oscillateur interne
-    LCD_SendCommand(0x70);                 // contraste
-    LCD_SendCommand(0x56);                 // alimentation / contraste
-    LCD_SendCommand(0x6C);                 // follower control
-    HAL_Delay(200);
-    LCD_SendCommand(0x38);                 // retour au mode normal
-    LCD_SendCommand(0x0C);                 // affichage ON, curseur OFF
-    LCD_Clear();
+    HAL_Delay(50);              /* Attente stabilisation alimentation (>40 ms après VDD) */
+    LCD_SendCommand(0x38);      /* Function Set : 8 bits, 2 lignes, mode normal */
+    LCD_SendCommand(0x39);      /* Function Set : mode extension IS=1 */
+    LCD_SendCommand(0x14);      /* Internal OSC frequency */
+    LCD_SendCommand(0x70);      /* Contrast set (bits C3:C0) */
+    LCD_SendCommand(0x56);      /* Power/ICON/Contrast : booster ON */
+    LCD_SendCommand(0x6C);      /* Follower control activé */
+    HAL_Delay(200);             /* Délai de stabilisation de l'ampli suiveur */
+    LCD_SendCommand(0x38);      /* Retour en mode normal (IS=0) */
+    LCD_SendCommand(0x0C);      /* Display ON, curseur OFF, blink OFF */
+    LCD_Clear();                /* Effacement initial */
 }
 
-static void LCD_SetCursor(uint8_t row, uint8_t col)   // place le curseur
+/**
+ * @brief Positionne le curseur LCD à la ligne et colonne spécifiées.
+ * @param row  Ligne : 0 = première ligne, 1 = deuxième ligne.
+ * @param col  Colonne : 0 à 15.
+ * @note  L'adresse DDRAM de la ligne 1 commence à 0x40 (standard LCD 16x2).
+ */
+static void LCD_SetCursor(uint8_t row, uint8_t col)
 {
-    uint8_t addr = (row == 0) ? 0x00 : 0x40;          // adresse DDRAM ligne 1 ou 2
-    LCD_SendCommand(0x80 | (addr + col));
+    uint8_t addr = (row == 0) ? 0x00 : 0x40;   /* Adresse DDRAM de base selon la ligne */
+    LCD_SendCommand(0x80 | (addr + col));        /* Commande "Set DDRAM Address" */
 }
 
-static void LCD_Print(const char *s)       // affiche une chaîne caractère par caractère
+/**
+ * @brief Affiche une chaîne de caractères à la position courante du curseur.
+ * @param s  Pointeur vers la chaîne terminée par '\0'.
+ */
+static void LCD_Print(const char *s)
 {
     while (*s)
-        LCD_SendChar((uint8_t)*s++);
+        LCD_SendChar((uint8_t)*s++);  /* Envoie chaque caractère jusqu'au '\0' */
 }
 
-/* Fonctions ADC / humidité / lumière */
-static void ADC_SelectChannel(uint32_t channel)   // change le canal ADC actif
+/* ═══════════════════════════════════════════════════════════
+ *  ADC — fonctions de lecture des capteurs
+ * ═══════════════════════════════════════════════════════════ */
+
+/**
+ * @brief Reconfigure dynamiquement le canal actif de l'ADC1.
+ *
+ *        L'ADC1 est partagé entre le capteur d'humidité (CH15) et la
+ *        photorésistance (CH6). Cette fonction change le canal sans
+ *        réinitialiser l'ADC entier.
+ *
+ * @param channel  Canal ADC à sélectionner (ex. ADC_CHANNEL_15).
+ */
+static void ADC_SelectChannel(uint32_t channel)
 {
     ADC_ChannelConfTypeDef sConfig = {0};
-    sConfig.Channel = channel;
-    sConfig.Rank = ADC_REGULAR_RANK_1;
-    sConfig.SamplingTime = ADC_SAMPLETIME_47CYCLES_5;
+    sConfig.Channel      = channel;
+    sConfig.Rank         = ADC_REGULAR_RANK_1;            /* Un seul canal en séquence régulière */
+    sConfig.SamplingTime = ADC_SAMPLETIME_47CYCLES_5;     /* Temps d'échantillonnage : 47,5 cycles */
     (void)HAL_ADC_ConfigChannel(&hadc1, &sConfig);
 }
-static float ReadMoistureVoltage(void)     // lit la tension du capteur d’humidité
-{
-    ADC_SelectChannel(MOIST_ADC_CHANNEL);  // sélectionne PB0
-    HAL_Delay(1);                          // laisse le signal se stabiliser
 
-    HAL_ADC_Start(&hadc1);                 // démarre conversion
+/**
+ * @brief Lit la tension analogique en sortie du capteur d'humidité du sol.
+ *
+ *        Sélectionne le canal ADC_CHANNEL_15, lance une conversion simple,
+ *        et convertit la valeur brute en tension (V).
+ *        Formule : V = raw × VREF / ADC_MAX_COUNTS
+ *
+ * @return Tension en volts [0,0 ; 3,3], ou 0,0 en cas d'erreur de conversion.
+ */
+static float ReadMoistureVoltage(void)
+{
+    ADC_SelectChannel(MOIST_ADC_CHANNEL);
+    HAL_Delay(1);                    /* Délai de stabilisation du multiplexeur ADC */
+    HAL_ADC_Start(&hadc1);
     if (HAL_ADC_PollForConversion(&hadc1, 10) != HAL_OK)
     {
         HAL_ADC_Stop(&hadc1);
-        return 0.0f;
+        return 0.0f;                 /* Timeout conversion → valeur nulle de sécurité */
     }
-
-    uint32_t raw = HAL_ADC_GetValue(&hadc1);   // récupère la valeur brute ADC
+    uint32_t raw = HAL_ADC_GetValue(&hadc1);
     HAL_ADC_Stop(&hadc1);
-
-    return ((float)raw * VREF) / ADC_MAX_COUNTS;  // convertit en volts
+    return ((float)raw * VREF) / ADC_MAX_COUNTS;  /* Conversion counts → volts */
 }
-static float VoltageToPercent(float v)     // convertit la tension humidité en %
-{
-    if (v <= DRY_VOLTAGE) return 0.0f;     // en dessous du seuil sec
-    if (v >= WET_VOLTAGE) return 100.0f;   // au-dessus du seuil humide
 
+/**
+ * @brief Convertit une tension capteur d'humidité en pourcentage d'humidité sol.
+ *
+ *        Interpolation linéaire entre DRY_VOLTAGE (0 %) et WET_VOLTAGE (100 %).
+ *        Les valeurs hors plage sont clampées à 0 % ou 100 %.
+ *
+ * @param v  Tension lue sur le capteur (V).
+ * @return   Humidité en % [0,0 ; 100,0].
+ */
+static float VoltageToPercent(float v)
+{
+    if (v <= DRY_VOLTAGE) return 0.0f;    /* Sol sec : limite basse */
+    if (v >= WET_VOLTAGE) return 100.0f;  /* Sol saturé : limite haute */
     float p = ((v - DRY_VOLTAGE) / (WET_VOLTAGE - DRY_VOLTAGE)) * 100.0f;
     return p;
 }
-static uint32_t ReadLightRaw(void)         // lit la lumière en valeur ADC brute
+
+/**
+ * @brief Lit la valeur brute ADC de la photorésistance (canal ADC_CHANNEL_6).
+ *
+ *        Une première conversion est effectuée et ignorée pour laisser le temps
+ *        au multiplexeur et à l'échantillonneur-bloqueur de se stabiliser après
+ *        le changement de canal (charge résiduelle du canal précédent).
+ *        La deuxième conversion est la valeur retournée.
+ *
+ *        Le temps d'échantillonnage plus long (247,5 cycles) compense l'impédance
+ *        de source élevée d'une photorésistance.
+ *
+ * @return Valeur brute ADC [0 ; 4095], ou 0 en cas d'erreur.
+ */
+static uint32_t ReadLightRaw(void)
 {
     ADC_ChannelConfTypeDef sConfig = {0};
-    sConfig.Channel = LIGHT_ADC_CHANNEL;   // sélectionne PA1
-    sConfig.Rank = ADC_REGULAR_RANK_1;
-    sConfig.SamplingTime = ADC_SAMPLETIME_247CYCLES_5;  // temps long pour stabilité
-
+    sConfig.Channel      = LIGHT_ADC_CHANNEL;
+    sConfig.Rank         = ADC_REGULAR_RANK_1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_247CYCLES_5;   /* Temps long pour haute impédance source */
     if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) return 0;
 
-    HAL_ADC_Start(&hadc1);                 // 1re conversion "dummy"
+    /* --- Première conversion ignorée (purge du sample-and-hold) --- */
+    HAL_ADC_Start(&hadc1);
     if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK)
-        (void)HAL_ADC_GetValue(&hadc1);    // on jette cette mesure
+        (void)HAL_ADC_GetValue(&hadc1);   /* Valeur lue mais jetée volontairement */
     HAL_ADC_Stop(&hadc1);
 
-    HAL_ADC_Start(&hadc1);                 // vraie conversion
+    /* --- Deuxième conversion : valeur exploitable --- */
+    HAL_ADC_Start(&hadc1);
     if (HAL_ADC_PollForConversion(&hadc1, 10) != HAL_OK)
     {
         HAL_ADC_Stop(&hadc1);
-        return 0;
+        return 0;   /* Timeout → valeur nulle de sécurité */
     }
-
     uint32_t raw = HAL_ADC_GetValue(&hadc1);
     HAL_ADC_Stop(&hadc1);
     return raw;
 }
-static float LightRawToPercent(uint32_t raw)   // convertit la lumière brute en %
+
+/**
+ * @brief Convertit une valeur brute ADC de photorésistance en pourcentage de luminosité.
+ *
+ *        Interpolation linéaire entre LIGHT_RAW_DARK (0 %) et LIGHT_RAW_BRIGHT (100 %).
+ *        Les valeurs hors plage sont clampées.
+ *
+ * @param raw  Valeur brute ADC [0 ; 4095].
+ * @return     Luminosité en % [0,0 ; 100,0].
+ */
+static float LightRawToPercent(uint32_t raw)
 {
     float v = (float)raw;
-
-    if (v <= LIGHT_RAW_DARK) return 0.0f;         // obscurité
-    if (v >= LIGHT_RAW_BRIGHT) return 100.0f;     // forte lumière
-
+    if (v <= LIGHT_RAW_DARK)   return 0.0f;    /* Obscurité totale */
+    if (v >= LIGHT_RAW_BRIGHT) return 100.0f;  /* Plein soleil */
     float p = ((v - LIGHT_RAW_DARK) / (LIGHT_RAW_BRIGHT - LIGHT_RAW_DARK)) * 100.0f;
     return p;
 }
 
-Dans /* USER CODE BEGIN 2 */
-HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);      // démarre le PWM sur TIM2 canal 1
-__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 250); // fixe le duty cycle
+/* USER CODE END 0 */
 
-LCD_Init();                                    // initialise l’écran LCD
+/**
+  * @brief  Point d'entrée du programme.
+  *         Initialise les périphériques, démarre le PWM de la LED,
+  *         affiche un message de démarrage, puis boucle en lisant
+  *         les deux capteurs et en mettant à jour le LCD toutes les ~500 ms.
+  */
+int main(void)
+{
+  /* USER CODE BEGIN 1 */
+  /* USER CODE END 1 */
 
-LCD_SetCursor(0, 0);                           // positionne curseur ligne 1
-LCD_Print("Moisture sensor");                  // message de démarrage
-LCD_SetCursor(1, 0);                           // positionne curseur ligne 2
-LCD_Print("Init OK");                          // message de confirmation
-HAL_Delay(800);                                // laisse le message visible
-LCD_Clear();                                   // efface l’écran
+  HAL_Init();               /* Initialisation de la HAL (SysTick, NVIC, etc.) */
 
-Dans /* USER CODE BEGIN 3 */
-float v = ReadMoistureVoltage();               // lit la tension humidité
-float pct = VoltageToPercent(v);               // convertit en % humidité
+  /* USER CODE BEGIN Init */
+  /* USER CODE END Init */
 
-int v_mV = (int)(v * 1000.0f + 0.5f);          // convertit en mV entiers avec arrondi
-int pct_i = (int)(pct + 0.5f);                 // % humidité arrondi
+  SystemClock_Config();     /* Configuration de l'horloge système (PLL → 80 MHz) */
 
-snprintf(line1, sizeof(line1), "V=%d.%03dV %3d%%",
-         v_mV/1000, v_mV%1000, pct_i);         // prépare le texte de la ligne 1
-uint32_t light_raw = ReadLightRaw();           // lit la valeur brute du capteur de lumière
-float light_pct = LightRawToPercent(light_raw);// convertit en % lumière
-int light_i =
+  /* USER CODE BEGIN SysInit */
+  /* USER CODE END SysInit */
+
+  MX_GPIO_Init();           /* Initialisation des GPIO */
+  MX_ADC1_Init();           /* Initialisation de l'ADC1 (capteurs humidité + lumière) */
+  MX_I2C1_Init();           /* Initialisation de l'I2C1 (LCD) */
+  MX_TIM2_Init();           /* Initialisation du TIM2 (PWM LED) */
+
+  /* USER CODE BEGIN 2 */
+
+  /* --- Démarrage du PWM sur TIM2 canal 1 (commande LED) ---
+   * Compare register = 250 ; rapport cyclique = 250 / ARR (défini dans MX_TIM2_Init). */
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 250);   /* Rapport cyclique fixe */
+
+  /* --- Initialisation et message de démarrage sur le LCD --- */
+  LCD_Init();
+  LCD_SetCursor(0, 0);
+  LCD_Print("Moisture sensor");
+  LCD_SetCursor(1, 0);
+  LCD_Print("Init OK");
+  HAL_Delay(800);           /* Affichage pendant 800 ms */
+  LCD_Clear();
+
+  /* USER CODE END 2 */
+
+  /* Boucle principale — rafraîchissement toutes les ~500 ms */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+  /* USER CODE END WHILE */
+
+  /* USER CODE BEGIN 3 */
+
+    /* --- Mesure humidité sol --- */
+    float v   = ReadMoistureVoltage();      /* Tension brute en volts */
+    float pct = VoltageToPercent(v);        /* Conversion en % humidité */
+
+    /* Formatage entier (évite %f dans snprintf, plus léger sur µC) :
+     * v_mV = tension en millivolts arrondie, pct_i = pourcentage arrondi. */
+    int v_mV  = (int)(v * 1000.0f + 0.5f);
+    int pct_i = (int)(pct + 0.5f);
+    snprintf(line1, sizeof(line1), "V=%d.%03dV %3d%%",
+             v_mV / 1000, v_mV % 1000, pct_i); /* Ex : "V=1.823V  42%" */
+
+    /* --- Mesure luminosité --- */
+    uint32_t light_raw = ReadLightRaw();            /* Valeur brute ADC [0 ; 4095] */
+    float light_pct    = LightRawToPercent(light_raw);
+    int light_i        = (int)(light_pct + 0.5f);  /* Arrondi entier */
+    snprintf(line2, sizeof(line2), "Light: %3d%%", light_i);  /* Ex : "Light:  67%" */
+
+    /* --- Mise à jour LCD ligne 1 (humidité) ---
+     * Effacement manuel par 16 espaces avant l'écriture pour éviter les artefacts
+     * résiduels (pas de LCD_Clear pour ne pas provoquer de clignotement visible). */
+    LCD_SetCursor(0, 0);
+    LCD_Print("                ");
+    LCD_SetCursor(0, 0);
+    LCD_Print(line1);
+
+    /* --- Mise à jour LCD ligne 2 (luminosité) --- */
+    LCD_SetCursor(1, 0);
+    LCD_Print("                ");
+    LCD_SetCursor(1, 0);
+    LCD_Print(line2);
+
+    /* Remet l'ADC sur le canal humidité avant la prochaine itération,
+     * puis attend 500 ms (cadence de rafraîchissement). */
+    ADC_SelectChannel(MOIST_ADC_CHANNEL);
+    HAL_Delay(500);
+
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief Configuration de l'horloge système.
+  *
+  *        Source : HSI (16 MHz)
+  *        PLL : × 10 / 2 → SYSCLK = 80 MHz
+  *        AHB, APB1, APB2 : diviseur 1 → 80 MHz
+  *        Latence Flash : 4 wait states (requis à 80 MHz, VDD = 3,3 V, VOS1)
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /* Mise à l'échelle du régulateur de tension (VOS1 requis pour 80 MHz) */
+  if (HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1) != HAL_OK)
+    Error_Handler();
+
+  /* Configuration de l'oscillateur HSI et de la PLL */
+  RCC_OscInitStruct.OscillatorType      = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState            = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState        = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource       = RCC_PLLSOURCE_HSI;   /* Entrée PLL : HSI 16 MHz */
+  RCC_OscInitStruct.PLL.PLLM            = 1;                    /* Prédiviseur : ÷1 → 16 MHz */
+  RCC_OscInitStruct.PLL.PLLN            = 10;                   /* Multiplicateur : ×10 → 160 MHz VCO */
+  RCC_OscInitStruct.PLL.PLLP            = RCC_PLLP_DIV7;       /* Sortie PLLP : ÷7 (SAI) */
+  RCC_OscInitStruct.PLL.PLLQ            = RCC_PLLQ_DIV2;       /* Sortie PLLQ : ÷2 → 80 MHz (USB/RNG) */
+  RCC_OscInitStruct.PLL.PLLR            = RCC_PLLR_DIV2;       /* Sortie PLLR : ÷2 → 80 MHz (SYSCLK) */
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+    Error_Handler();
+
+  /* Configuration des horloges de bus */
+  RCC_ClkInitStruct.ClockType      = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+                                   | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;  /* SYSCLK = PLLR = 80 MHz */
+  RCC_ClkInitStruct.AHBCLKDivider  = RCC_SYSCLK_DIV1;          /* HCLK  = 80 MHz */
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;            /* PCLK1 = 80 MHz */
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;            /* PCLK2 = 80 MHz */
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
+    Error_Handler();
+}
+
+/* USER CODE BEGIN 4 */
+/* USER CODE END 4 */
+
+/**
+  * @brief  Gestionnaire d'erreur.
+  *         Désactive les interruptions et bloque en boucle infinie.
+  *         En mode debug, un point d'arrêt ici permet d'identifier l'origine.
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  __disable_irq();   /* Désactivation globale des interruptions */
+  while (1) {}       /* Blocage — à inspecter avec le débogueur */
+  /* USER CODE END Error_Handler_Debug */
+}
+
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Callback appelé par assert_param() si une assertion échoue.
+  * @param  file  Fichier source où l'assertion a échoué.
+  * @param  line  Numéro de ligne concerné.
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* USER CODE END 6 */
+}
+#endif
